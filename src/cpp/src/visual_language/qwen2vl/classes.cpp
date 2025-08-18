@@ -19,9 +19,253 @@ std::string NATIVE_TAG = "<|vision_start|><|image_pad|><|vision_end|>";
 } // namespace
 
 namespace qwen2_vl_utils {
+ov::Output<ov::Node> create_bicubic_resize_subgraph(ov::Output<ov::Node> input, ov::Output<ov::Node> target_size) {
+    // Create axes for height and width dimensions (assuming NCHW layout)
+    auto axes = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{2}, {2, 3});
+
+    // Configure interpolation attributes for bicubic resize
+    ov::op::v11::Interpolate::InterpolateAttrs attrs;
+    attrs.mode = ov::op::v11::Interpolate::InterpolateMode::CUBIC;
+    attrs.shape_calculation_mode = ov::op::v11::Interpolate::ShapeCalcMode::SIZES;
+    attrs.coordinate_transformation_mode = ov::op::v11::Interpolate::CoordinateTransformMode::PYTORCH_HALF_PIXEL;
+    attrs.cube_coeff = -0.75f;  // Standard bicubic coefficient
+    attrs.nearest_mode = ov::op::v11::Interpolate::NearestMode::ROUND_PREFER_FLOOR;
+    attrs.pads_begin = {0, 0};
+    attrs.pads_end = {0, 0};
+    attrs.antialias = false;
+
+    // Create interpolate operation
+    auto interpolate = std::make_shared<ov::op::v11::Interpolate>(input, target_size, axes, attrs);
+    interpolate->set_friendly_name("bicubic_resize");
+
+    return interpolate;
+}
+
+ov::Output<ov::Node> create_normalization_subgraph(const ov::Output<ov::Node>& input,
+                                             ov::Output<ov::Node>& mean,
+                                             ov::Output<ov::Node>& std) {
+    // Convert input to float if needed
+    auto input_f32 = std::make_shared<ov::op::v0::Convert>(input, ov::element::f32);
+
+    // Scale to [0,1]
+    auto scale_const = ov::op::v0::Constant::create(ov::element::f32, {1}, {1.0f / 255.0f});
+    auto scaled = std::make_shared<ov::op::v1::Multiply>(input_f32, scale_const);
+
+    // Subtract mean
+    auto mean_subtracted = std::make_shared<ov::op::v1::Subtract>(scaled, mean);
+
+    // Divide by std
+    auto normalized = std::make_shared<ov::op::v1::Divide>(mean_subtracted, std);
+
+    return normalized;
+}
+
+ov::Output<ov::Node> create_transpose_patches_subgraph(ov::Output<ov::Node> input,
+                                                       ov::Output<ov::Node> reshape_dims,
+                                                       ov::Output<ov::Node> transpose_order) {
+    // Reshape input to the required dimensions
+    auto reshaped = std::make_shared<ov::op::v1::Reshape>(input, reshape_dims, false);
+    reshaped->set_friendly_name("reshaped_patches");
+
+    // Transpose the reshaped tensor
+    auto transposed = std::make_shared<ov::op::v1::Transpose>(reshaped, transpose_order);
+    transposed->set_friendly_name("transposed_patches");
+
+    return transposed;
+}
+
+ov::Output<ov::Node> create_flatten_patches_subgraph(ov::Output<ov::Node> input, ov::Output<ov::Node> flatten_shape) {
+    // Reshape (flatten) the input tensor
+    auto flattened = std::make_shared<ov::op::v1::Reshape>(input, flatten_shape, false);
+    flattened->set_friendly_name("flattened_patches");
+
+    return flattened;
+}
 
 std::shared_ptr<ov::Model> patch_preprocess_into_model(std::shared_ptr<ov::Model> model_org) {
-    return model_org;
+ std::shared_ptr<ov::Model> model_org,
+    const ov::Shape& input_shape,
+    bool add_dynamic_shapes,
+    const std::vector<float>& mean,
+    const std::vector<float>& std) {
+    
+    // Create a copy of the original model
+    auto model = model_org->clone();
+    
+    // Get the original model's parameters and results
+    const auto& params = model->get_parameters();
+    const auto& results = model->get_results();
+    
+    // Check if the model has at least one parameter and one result
+    if (params.empty() || results.empty()) {
+        throw std::runtime_error("Model must have at least one parameter and one result");
+    }
+    
+    // Find the original input parameter
+    auto original_param = params[0];
+    
+    // Create new input parameter for the image
+    ov::PartialShape input_pshape;
+    if (add_dynamic_shapes) {
+        // Use dynamic shapes for batch size, height, and width
+        input_pshape = ov::PartialShape({-1, input_shape[1], -1, -1});
+    } else {
+        input_pshape = input_shape;
+    }
+    
+    auto image_param = std::make_shared<ov::op::v0::Parameter>(ov::element::u8, input_pshape);
+    image_param->set_friendly_name("image_input");
+    
+    // Create parameter for target size (height, width)
+    auto target_size_param = std::make_shared<ov::op::v0::Parameter>(ov::element::i64, ov::Shape{2});
+    target_size_param->set_friendly_name("target_size");
+    
+    // Set default values for target size based on input_shape
+    ov::Tensor default_target_size(ov::element::i64, ov::Shape{2});
+    int64_t* target_size_data = default_target_size.data<int64_t>();
+    target_size_data[0] = 224;  // Default height
+    target_size_data[1] = 224;  // Default width
+    target_size_param->set_default_value(default_target_size);
+    
+    // Create parameter for patch configuration
+    auto patch_config_param = std::make_shared<ov::op::v0::Parameter>(ov::element::i64, ov::Shape{5});
+    patch_config_param->set_friendly_name("patch_config");
+    // patch_config contains: [patch_size, merge_size, temporal_patch_size, grid_h, grid_w]
+    
+    // Set default values for patch configuration
+    // These values match the defaults used in VisionEncoderQwen2VL::encode
+    ov::Tensor default_patch_config(ov::element::i64, ov::Shape{5});
+    int64_t* config_data = default_patch_config.data<int64_t>();
+    config_data[0] = 16;  // patch_size
+    config_data[1] = 1;   // merge_size
+    config_data[2] = 1;   // temporal_patch_size
+    config_data[3] = 14;  // grid_h (224/16)
+    config_data[4] = 14;  // grid_w (224/16)
+    patch_config_param->set_default_value(default_patch_config);
+    
+    // Default values
+    int channels = 3;
+    int grid_t = 1;
+    
+    // Extract patch configuration components
+    // We'll use GetSlice operations to extract components from patch_config_param
+    // patch_config contains: [patch_size, merge_size, temporal_patch_size, grid_h, grid_w]
+    
+    // Create constants for indices
+    auto patch_size_idx = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {0});
+    auto merge_size_idx = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {1});
+    auto temporal_patch_size_idx = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {2});
+    auto grid_h_idx = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {3});
+    auto grid_w_idx = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {4});
+    
+    // Extract individual values using Gather operations
+    auto patch_size = std::make_shared<ov::op::v8::Gather>(
+        patch_config_param, patch_size_idx, ov::op::v0::Constant::create(ov::element::i64, ov::Shape{}, {0}));
+    patch_size->set_friendly_name("patch_size_param");
+    
+    auto merge_size = std::make_shared<ov::op::v8::Gather>(
+        patch_config_param, merge_size_idx, ov::op::v0::Constant::create(ov::element::i64, ov::Shape{}, {0}));
+    merge_size->set_friendly_name("merge_size_param");
+    
+    auto temporal_patch_size = std::make_shared<ov::op::v8::Gather>(
+        patch_config_param, temporal_patch_size_idx, ov::op::v0::Constant::create(ov::element::i64, ov::Shape{}, {0}));
+    temporal_patch_size->set_friendly_name("temporal_patch_size_param");
+    
+    auto grid_h = std::make_shared<ov::op::v8::Gather>(
+        patch_config_param, grid_h_idx, ov::op::v0::Constant::create(ov::element::i64, ov::Shape{}, {0}));
+    grid_h->set_friendly_name("grid_h_param");
+    
+    auto grid_w = std::make_shared<ov::op::v8::Gather>(
+        patch_config_param, grid_w_idx, ov::op::v0::Constant::create(ov::element::i64, ov::Shape{}, {0}));
+    grid_w->set_friendly_name("grid_w_param");
+    
+    // Calculate grid_h / merge_size and grid_w / merge_size
+    auto grid_h_div_merge = std::make_shared<ov::op::v1::Divide>(grid_h, merge_size);
+    grid_h_div_merge->set_friendly_name("grid_h_div_merge");
+    
+    auto grid_w_div_merge = std::make_shared<ov::op::v1::Divide>(grid_w, merge_size);
+    grid_w_div_merge->set_friendly_name("grid_w_div_merge");
+    
+    // Create constant for grid_t and channels
+    auto grid_t_const = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {grid_t});
+    auto channels_const = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{1}, {channels});
+    
+    // Create reshape dimensions dynamically
+    // We need to concatenate all the values into a single tensor
+    std::vector<ov::Output<ov::Node>> reshape_dims_components = {
+        grid_t_const,                // grid_t
+        temporal_patch_size,         // temporal_patch_size
+        channels_const,              // channel
+        grid_h_div_merge,            // grid_h / merge_size
+        merge_size,                  // merge_size
+        patch_size,                  // patch_size
+        grid_w_div_merge,            // grid_w / merge_size
+        merge_size,                  // merge_size
+        patch_size                   // patch_size
+    };
+    
+    auto reshape_dims = std::make_shared<ov::op::v0::Concat>(reshape_dims_components, 0);
+    reshape_dims->set_friendly_name("reshape_dims");
+    
+    // Default values for transpose order based on transpose_image_patches implementation
+    auto transpose_order = ov::op::v0::Constant::create(
+        ov::element::i64, 
+        ov::Shape{9}, 
+        {0, 3, 6, 4, 7, 2, 1, 5, 8});
+    transpose_order->set_friendly_name("transpose_order_const");
+    
+    // Calculate flatten shape based on patch configuration
+    // num_patches = grid_h * grid_w
+    auto num_patches = std::make_shared<ov::op::v1::Multiply>(grid_h, grid_w);
+    num_patches->set_friendly_name("num_patches");
+    
+    // features_per_patch = channels * temporal_patch_size * patch_size * patch_size
+    auto patch_size_squared = std::make_shared<ov::op::v1::Multiply>(patch_size, patch_size);
+    auto temp_patch_size_times_patch_squared = std::make_shared<ov::op::v1::Multiply>(
+        temporal_patch_size, patch_size_squared);
+    auto features_per_patch = std::make_shared<ov::op::v1::Multiply>(
+        channels_const, temp_patch_size_times_patch_squared);
+    features_per_patch->set_friendly_name("features_per_patch");
+    
+    // Concatenate num_patches and features_per_patch to create flatten_shape
+    auto flatten_shape = std::make_shared<ov::op::v0::Concat>(
+        ov::OutputVector{num_patches, features_per_patch}, 0);
+    flatten_shape->set_friendly_name("flatten_shape");
+    
+    // Create the preprocessing subgraph
+    // 1. Bicubic resize
+    auto resized = qwen2_vl_utils::create_bicubic_resize_subgraph(image_param, target_size_param);
+    
+    // 2. Normalization (similar to clip_image_preprocess)
+    auto normalized = qwen2_vl_utils::create_normalization_subgraph(resized, mean, std);
+    
+    // 3. Transpose patches
+    auto transposed = qwen2_vl_utils::create_transpose_patches_subgraph(
+        normalized, reshape_dims, transpose_order);
+    
+    // 4. Flatten patches
+    auto flattened = qwen2_vl_utils::create_flatten_patches_subgraph(transposed, flatten_shape);
+    
+    // Replace the original model's input with the preprocessed output
+    // Find all nodes that use the original parameter as input
+    for (const auto& node : model->get_ops()) {
+        for (size_t i = 0; i < node->get_input_size(); ++i) {
+            auto input_source = node->get_input_source_output(i);
+            
+            // If this input comes from the original model's parameter, replace it
+            if (input_source.get_node_shared_ptr() == original_param) {
+                node->input(i).replace_source_output(flattened);
+            }
+        }
+    }
+    
+    // Create a new model with the preprocessing subgraph
+    ov::ParameterVector new_params = {image_param, target_size_param, patch_config_param};
+    
+    auto new_model = std::make_shared<ov::Model>(results, new_params);
+    new_model->set_friendly_name(model_org->get_friendly_name() + "_with_preprocessing");
+    
+    return new_model;
 }
 
 ImageSize smart_resize(size_t height, size_t width, size_t factor, size_t min_pixels, size_t max_pixels) {
