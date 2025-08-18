@@ -8,7 +8,7 @@
 
 #include "utils.hpp"
 #include "visual_language/vl_sdpa_transformations.hpp"
-
+#include <openvino/opsets/opset3.hpp>
 namespace ov::genai {
 
 namespace {
@@ -19,6 +19,10 @@ std::string NATIVE_TAG = "<|vision_start|><|image_pad|><|vision_end|>";
 } // namespace
 
 namespace qwen2_vl_utils {
+
+std::shared_ptr<ov::Model> patch_preprocess_into_model(std::shared_ptr<ov::Model> model_org) {
+    return model_org;
+}
 
 ImageSize smart_resize(size_t height, size_t width, size_t factor, size_t min_pixels, size_t max_pixels) {
     if (height < factor || width < factor) {
@@ -313,6 +317,41 @@ ov::Tensor merge_text_and_image_embeddings(
 }
     
 } // namespace qwen2vl_utils
+
+std::unique_ptr<CircularBufferQueue<ov::InferRequest>> VisionEncoderQwen2VL::create_ireq(
+    ov::CompiledModel& compiled_model) {
+    ov::genai::utils::print_compiled_model_properties(compiled_model, "VLM vision embeddings model");
+    return std::make_unique<CircularBufferQueue<ov::InferRequest>>(
+        compiled_model.get_property(ov::optimal_number_of_infer_requests),
+        [&compiled_model]() -> ov::InferRequest {
+            return compiled_model.create_infer_request();
+        });
+}
+
+VisionEncoderQwen2VL::VisionEncoderQwen2VL(const std::filesystem::path& model_dir,
+                                           const std::string& device,
+                                           const ov::AnyMap properties)
+    : VisionEncoder(model_dir, device, properties) {
+    auto model_org = utils::singleton_core().read_model(model_dir / "openvino_vision_embeddings_model.xml");
+    auto model = qwen2_vl_utils::patch_preprocess_into_model(model_org);
+    auto compiled_model = utils::singleton_core().compile_model(model, device, properties);
+    m_ireq_queue_vision_encoder = create_ireq(compiled_model);
+}
+
+VisionEncoderQwen2VL::VisionEncoderQwen2VL(const ModelsMap& models_map,
+                                           const std::filesystem::path& config_dir_path,
+                                           const std::string& device,
+                                           const ov::AnyMap device_config)
+    : VisionEncoder(models_map, config_dir_path, device, device_config) {
+    const auto& vision_encoder_model = utils::get_model_weights_pair(models_map, "vision_embeddings").first;
+    const auto& vision_encoder_weights = utils::get_model_weights_pair(models_map, "vision_embeddings").second;
+
+    auto model_org = utils::singleton_core().read_model(vision_encoder_model, vision_encoder_weights);
+    auto model = qwen2_vl_utils::patch_preprocess_into_model(model_org);
+
+    auto compiled_model = utils::singleton_core().compile_model(model, device, device_config);
+    m_ireq_queue_vision_encoder = create_ireq(compiled_model);
+}
 
 EncodedImage VisionEncoderQwen2VL::encode(const ov::Tensor& image, const ov::AnyMap& config_map) {
     CircularBufferQueueElementGuard<ov::InferRequest> infer_request_guard(this->m_ireq_queue_vision_encoder.get());
