@@ -115,7 +115,7 @@ std::shared_ptr<ov::Model> patch_preprocess_into_model(std::shared_ptr<ov::Model
 
     auto img_normalized = create_normalization_subgraph(img_bicubic_resize, img_mean, img_std);
 
-    auto temporal_images = std::make_shared<ov::op::v3::Broadcast>(img_normalized, broadcast_shape);
+    auto temporal_images = std::make_shared<ov::op::v0::Tile>(img_normalized, broadcast_shape);
 
     auto img_reshape_8d_trans = create_transpose_patches_subgraph(
         temporal_images,
@@ -509,7 +509,11 @@ EncodedImage VisionEncoderQwen2VL::encode(const ov::Tensor& image, const ov::Any
     size_t grid_h = target_image_size.height / config.patch_size;
     size_t grid_w = target_image_size.width / config.patch_size;
 
-    uint64_t a_broadcast_shape[4] = {temporal_patch_size, channel, target_image_size.height, target_image_size.width};
+    size_t repeats = 1;
+    if (patches_shape.at(0) == 1) {
+        repeats = config.temporal_patch_size;
+    }
+    uint64_t a_broadcast_shape[4] = {static_cast<size_t>(repeats), 1, 1, 1};
     uint64_t a_temp_shape8d[8] = {grid_t,
                                   temporal_patch_size * channel,
                                   grid_h / config.merge_size,
